@@ -1,0 +1,458 @@
+library(dataRetrieval)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(FSA)
+library(brms)
+library(tidybayes)
+library(tidyr)
+library(tidyverse)
+library(magrittr)
+
+#####################################
+#########Growing Degree Days
+#####################################
+gd<-read.csv("TemperatureDataForGDD.csv")
+str(gd)
+gdd <- gd %>% mutate(DATE =  mdy(Date), 
+                     NAME = ifelse(grepl("SIOUX", Station), "Sioux Falls", "Menno"),
+                     TMAX = round((TMAX.F.-32)*5/9,1),
+                     TMIN = round((TMIN.F.-32)*5/9,1)) %>% 
+  filter(!is.na(TMAX)&!is.na(TMIN)) %>% 
+  mutate(Year = year(DATE),
+         Month = month(DATE), 
+         GDD = ifelse((((TMIN+TMAX)/2)-10)>0, (((TMIN+TMAX)/2)-10), 0))
+
+#James
+JamesGDD <- gdd %>% filter(NAME=="Menno"&Year<2023&Year>2013) %>% group_by(Year) %>% 
+  mutate(cumulativeGDD = cumsum(GDD)) %>% group_by(Year) %>% summarize(max(cumulativeGDD)) %>% as.data.frame(); JamesGDD
+
+#summarize counts by year to find missing data
+gdd %>% group_by(NAME,Year) %>% summarize(n=length(GDD)) %>% print(n=100)
+
+#####################################
+###########Discharge data
+#####################################
+#00060 is discharge
+#00065 is gauge height
+
+#James River Info
+siteNo <- "06478500"  #06478500 is Scotland; 06482020 Sioux Falls N. Cliff
+pCode <- "00060"
+start.date <- "2013-01-01"
+end.date <- "2022-12-31"
+
+#######Discharge Daily Values######
+dischargedv <- readNWISdv(siteNumbers = siteNo,
+                              parameterCd = pCode,
+                              startDate = start.date,
+                              endDate = end.date)
+dischargedv<-renameNWISColumns(dischargedv)
+
+dischargedv %<>% mutate(Year = as.numeric(format(dischargedv$Date, format = "%Y")), 
+                        Month = as.numeric(format(dischargedv$Date, format = "%m")), 
+                        Flow = Flow*0.0283168) ### Convert from cfs to cms
+
+ggplot(data = dischargedv,
+       aes(Date, Flow)) +
+  geom_line(linewidth=0.8)+
+  theme_classic()+
+  ylab("Discharge (cms)")+
+  theme(axis.text = element_text(size=15), 
+        axis.title = element_text(size=18))+
+  scale_y_continuous(labels = scales::comma, limits=c(0, 1500))
+
+#Mean annual monthly discharge
+dischargedv %>% group_by(Year, Month) %>% 
+  summarize(Mean_Disch=mean(Flow)) #%>% 
+
+#filter for Open Water only
+River_data<-filter(dischargedv, Month>3&Month<11)
+
+
+#Mean annual April-October discharge
+River_data %>% group_by(Year) %>% 
+  summarize(Mean_Disch = mean(Flow), Median_Disch=median(Flow)) 
+
+River_data %>% 
+  group_by(Year) %>% 
+  summarize(Mean_Disch = mean(Flow), 
+            Median_Disch=median(Flow),
+            Max_Disch=max(Flow)) %>% 
+  ggplot(aes(Year, Median_Disch)) +
+  geom_line(linewidth=0.8)+
+  geom_point()+
+  theme_classic()+
+  ylab("Discharge (cms)")+
+  theme(axis.text = element_text(size=15), 
+        axis.title = element_text(size=18))
+
+######################################################################
+#############     Back-Calculated Growth      ########################
+######################################################################
+BC <- readxl::read_excel("All_Spine_Measures_and_Back_Calculations.xlsx", sheet = "CCF")
+BC %>% group_by(Year) %>% summarize(n=length(Spp))
+BC_calc <- BC %>% 
+  mutate(YearID = paste(Year,ID, sep="_")) %>% 
+  pivot_longer(cols=c(Annuli_1:Annuli_9),
+               names_to=c("Age"),
+               values_to="Annuli_measurement") %>% 
+  separate(Age, c("name1", "Annuli_Age"), sep="_") %>%
+  select(-name1) %>% 
+  mutate(Annuli_Age = as.numeric(Annuli_Age)) %>% 
+  mutate(BCLen = round(Annuli_measurement/Spine_Radius*Length), 
+         GrowthYear = Year-Consensus_Age+Annuli_Age-1) %>% 
+  filter(!is.na(BCLen))%>% 
+  group_by(YearID) %>% 
+  filter(max(Annuli_Age)==Consensus_Age); BC_calc
+
+#calculate growth increment by year
+BC_inc <- BC_calc %>% 
+  group_by(YearID) %>% 
+  arrange(YearID, Annuli_Age) %>% 
+  mutate(Increment = ifelse(Annuli_Age==1,BCLen,ifelse(BCLen - lag(BCLen, default = first(BCLen))>0,BCLen - lag(BCLen, default = first(BCLen)),NA)),
+         Increment_Perc = 100*(Annuli_measurement - lag(Annuli_measurement, default = first(Annuli_measurement)))/lag(Annuli_measurement, default = first(Annuli_measurement))) %>% 
+  group_by(Year,ID) %>% 
+  arrange(Year,ID, Annuli_Age); BC_inc
+
+#
+BC_inc %>% group_by(Year, River) %>% summarize(n=length(unique(YearID)))
+
+####QAQC
+##Look through the dataset for each year & ID combo
+##Find any values which are <0 and mark them as NA
+##All values should be positive, because it is measure of growth as a % of previous radius size
+##Use the code below the loop to identify where the NA values are and what their ID numbers are
+ID2<-unique(BC_inc$ID)
+new<-data.frame(matrix(ncol = 0, nrow = 0))
+yrs<-seq(2017,2025,1) #CCF 2017-2023 are tested and good! 
+for(i in yrs)
+  for(j in 1:length(ID2)){
+  x<-filter(BC_inc, Year==i & ID==ID2[j])
+  y<-data.frame(vals=replace(x$BCLen, seq_along(x$BCLen) >= which(x$BCLen < cummax(x$BCLen))[1], NA))
+  y$j<-rep(j,length(y$vals))
+  y$i<-rep(i, length(y$vals))
+  new<-rbind(new, y)
+}
+
+which(is.na(new))
+new[6298,]
+ID2[1183]
+
+###################################################
+#Only using the 3 most recent annuli and only ages where there is a previous annuli for growth comparison
+#summarize the median increment & percentage increment 
+BC_sum <- BC_inc %>% 
+  filter(Consensus_Age - Annuli_Age < 3, !is.na(Increment)) %>% 
+  group_by(River, Annuli_Age,GrowthYear) %>% 
+  mutate(n=length(Increment)) %>% 
+  median_qi(Increment, Increment_Perc,n) %>%
+  select(-n.lower,-n.upper) %>% 
+  arrange(River,Annuli_Age, Increment); BC_sum
+
+#Plot Increments by age as boxplot
+BC_sum%>% 
+  ggplot(aes(x=Annuli_Age, y = Increment,col=as.factor(GrowthYear)))+
+  geom_boxplot(aes(group=Annuli_Age))+
+  geom_point(size=3)+
+  facet_wrap(~River)+
+  theme_classic()
+
+#Summarize discharge by year for plotting and modelling
+flows <- River_data %>% 
+  filter(Year>2013) %>% rename(GrowthYear=Year) %>% group_by(GrowthYear) %>% 
+  summarize(Mean_Disch = mean(Flow), Median_Disch=median(Flow), Max_Disch=max(Flow), Min_Disch=min(Flow));flows
+#plot  
+flows %>% ggplot(aes(x=GrowthYear, y=Median_Disch))+geom_line()+geom_point()
+
+##Combine flows and summary of increment data
+BC_sum_James<-subset(BC_sum, River=="James")
+final_df <- full_join(BC_sum_James, flows, by="GrowthYear"); final_df
+names(final_df)
+
+##Plot increment percent for each annuli age grouping
+pd <- position_dodge(width=0.4)
+
+final_df %>% filter(Annuli_Age>1,Annuli_Age<10, n>4) %>% #n>4 only include sample sizes of 5 or larger
+  ggplot(aes(x=Annuli_Age, y=Increment_Perc, col=as.factor(GrowthYear)))+
+  geom_point(size=2, position=pd)+
+  geom_errorbar(aes(ymin=Increment_Perc.lower, ymax=Increment_Perc.upper),
+                width=0.3, position=pd)+
+  theme_classic()+
+  scale_x_continuous(labels=seq(1,19,1), breaks=seq(1,19,1))
+
+##Plot raw increment  for each annuli age grouping
+final_df %>% 
+  filter(n>4, Annuli_Age<10) %>%  #only include sample sizes of 5 or larger
+  ggplot(aes(x=Annuli_Age, y=Increment, col=as.factor(GrowthYear)))+
+  geom_point(size=2, position=pd)+
+  geom_errorbar(aes(ymin=Increment.lower, ymax=Increment.upper),
+                width=0.3, position=pd)+
+  theme_classic()+
+  scale_x_continuous(labels=seq(1,12,1), breaks=seq(1,12,1))
+
+
+final_df %>% filter(Annuli_Age>1) %>% #n>4,
+  ggplot(aes(x=Median_Disch, y=Increment_Perc, col=as.factor(Annuli_Age)))+
+  geom_line(aes(group=Annuli_Age), linewidth=1)+
+  theme_classic()
+
+###################################################
+########   Model development process
+##################################################
+##ID as random effect
+BC_inc_James<-filter(BC_inc, River=="James")
+mod.dat<-BC_inc_James %>% 
+  filter(Consensus_Age - Annuli_Age < 3, !is.na(Increment)) %>% 
+  group_by(Annuli_Age,GrowthYear) %>% 
+  mutate(n=length(Increment))
+
+
+flows2 <- flows %>% 
+  mutate(Median_std = (Median_Disch-mean(unique(Median_Disch)))/sd(unique(Median_Disch)),
+         GDD = JamesGDD$`max(cumulativeGDD)`,
+         GDD_std = (GDD-mean(GDD))/sd(GDD))
+
+mod.data<-full_join(mod.dat, flows2, by="GrowthYear"); mod.data
+
+names(mod.data)
+
+mod.data %>%
+  group_by(GrowthYear, Annuli_Age) %>% 
+  summarize(inc = mean(Increment), 
+            age = mean(Consensus_Age))
+mod.data %>%
+  group_by(GrowthYear) %>% 
+  summarize(flow = mean(Median_Disch), 
+            flow_std = mean(Median_std))
+
+############ Age #############
+#Prior Prediction
+priors <- tibble(a = rnorm(300, 5, 1),
+                 b = rnorm(300, -0.4, 0.1),
+                 sigma = rexp(300, .1),
+                 sim = 1:300)
+
+# combine and simulate
+prior_and_x <- priors %>% expand_grid(Age = seq(2,9,1)) %>%    # combine priors and x's
+  mutate(mu = exp(a + b*Age),                              # create new column call it mu- simulate regressions
+         y = rgamma(nrow(.), mu, sigma))             # new column called y simulate data (e.g., y_rep)
+
+# plot
+prior_and_x %>% 
+  ggplot(aes(x = Age, y = mu, group = sim)) + 
+  geom_point() +
+  labs(y = "sim")
+
+##Implement the model
+get_prior(Increment_Perc ~ Annuli_Age + (1|YearID),
+          family = Gamma(link="log"),
+          data=filter(mod.data, Annuli_Age>1&Annuli_Age<10))
+
+ccf.age<-brm(Increment_Perc ~ Annuli_Age + (1|YearID),
+          family = Gamma(link="log"), 
+          data = filter(mod.data, Annuli_Age>1&Annuli_Age<10), 
+          prior = c(prior(normal(5, 1), class = "Intercept"),
+                    prior(normal(-0.4, 0.1), class = "b"),
+                    prior(exponential(1), class="sd", group="YearID"),
+                    prior(exponential(.1), class="shape")),
+          file = "Age_model.rds",
+          seed = 24,
+          file_refit = "on_change",
+          save_pars = save_pars(all = TRUE),
+          iter = 2000, chains = 4, cores = 6)
+
+summary(ccf.age)
+plot(ccf.age)
+plot(conditional_effects(ccf.age),points=T)
+pp_check(ccf.age)
+bayes_R2(ccf.age)
+#options(future.globals.maxSize = 2e9)
+loo_ccf.age <- loo(ccf.age, moment_match = T, reloo=T)
+
+
+
+
+#Sensitivity model
+ccf.age.sens<-brm(Increment_Perc ~ Annuli_Age + (1|YearID),
+                family = Gamma(link="log"), 
+                data = filter(mod.data, Annuli_Age>1&Annuli_Age<10), 
+                prior = c(prior(normal(5, 2), class = "Intercept"),
+                          prior(normal(-0.4, 0.2), class = "b"),
+                          prior(exponential(0.5), class="sd", group="YearID"),
+                          prior(exponential(0.05), class="shape")),
+                file = "Age_model_sens.rds",
+                seed = 24,
+                file_refit = "on_change",
+                iter = 2000, chains = 4, cores = 6)
+summary(ccf.age.sens)
+
+#Compare estimates from model and sensitivity - Percent difference
+(posterior_summary(ccf.age)[1,1]-posterior_summary(ccf.age.sens)[1,1])/posterior_summary(ccf.age)[1,1]*100 #intercept
+(posterior_summary(ccf.age)[2,1]-posterior_summary(ccf.age.sens)[2,1])/posterior_summary(ccf.age)[2,1]*100 #slope
+(posterior_summary(ccf.age)[3,1]-posterior_summary(ccf.age.sens)[3,1])/posterior_summary(ccf.age)[3,1]*100 #Random intercept
+(posterior_summary(ccf.age)[4,1]-posterior_summary(ccf.age.sens)[4,1])/posterior_summary(ccf.age)[4,1]*100 #shape
+
+############ Age + Discharge #############
+get_prior(Increment_Perc ~ Annuli_Age * Median_std + (1|YearID),
+          family = Gamma(link="log"),
+          data=mod.data)
+
+ccf.age_dis<-brm(Increment_Perc ~ Annuli_Age + Median_std + (1|YearID),
+           family = Gamma(link="log"), 
+           data = filter(mod.data, Annuli_Age>1&Annuli_Age<10), 
+           prior = c(prior(normal(5, 1), class = "Intercept"),
+                     prior(normal(-0.4, 0.1), class = "b", coef = "Annuli_Age"),
+                     prior(normal(0, 1), class = "b", coef = "Median_std"),
+                     prior(exponential(1), class="sd", group = "YearID"),
+                     prior(exponential(0.1), class="shape")),
+           file = "Age_Dis_model.rds",
+           seed = 24,
+           save_pars = save_pars(all = TRUE),
+           file_refit = "on_change",
+           iter = 2000, chains = 4, cores = 6)
+
+summary(ccf.age_dis)
+plot(ccf.age_dis)
+plot(conditional_effects(ccf.age_dis), points=T)
+pp_check(ccf.age_dis)
+bayes_R2(ccf.age_dis)
+loo_ccf.age_dis <- loo(ccf.age_dis, moment_match = T, reloo=T)
+
+#Age + GDD
+get_prior(Increment_Perc ~ Annuli_Age + GDD_std + (1|YearID),
+          family = Gamma(link="log"),
+          data=filter(mod.data, Annuli_Age>1&Annuli_Age<10))
+
+ccf.age_GDD<-brm(Increment_Perc ~ Annuli_Age + GDD_std + (1|YearID),
+               family = Gamma(link="log"), 
+               data = filter(mod.data, Annuli_Age>1&Annuli_Age<10), 
+               prior = c(prior(normal(5, 1), class = "Intercept"),
+                         prior(normal(-0.4, 0.1), class = "b", coef = "Annuli_Age"),
+                         prior(normal(0, 1), class = "b", coef = "GDD_std"),
+                         prior(exponential(1), class="sd", group = "YearID"),
+                         prior(exponential(0.1), class="shape")),
+               file = "Age_GDD_model.rds",
+               save_pars = save_pars(all = TRUE),
+               seed = 24,
+               file_refit = "on_change",
+               iter = 2000, chains = 4, cores = 6)
+
+summary(ccf.age_GDD)
+plot(ccf.age_GDD)
+plot(conditional_effects(ccf.age_GDD), points=T)
+pp_check(ccf.age_GDD)
+bayes_R2(ccf.age_GDD)
+loo_ccf.age_GDD <- loo(ccf.age_GDD, moment_match = T, reloo=T)
+
+########### Age + Discharge + GDD #############
+get_prior(Increment_Perc ~ Annuli_Age + Median_std + GDD_std + (1|YearID),
+          family = Gamma(link="log"),
+          data=mod.data)
+
+ccf.age_full<-brm(Increment_Perc ~ Annuli_Age + Median_std + GDD_std + (1|YearID),
+                 family = Gamma(link="log"), 
+                 data = filter(mod.data, Annuli_Age>1&Annuli_Age<10), 
+                 prior = c(prior(normal(5, 1), class = "Intercept"),
+                           prior(normal(-0.4, 0.1), class = "b", coef = "Annuli_Age"),
+                           prior(normal(0, 1), class = "b", coef = "Median_std"),
+                           prior(normal(0, 1), class = "b", coef = "GDD_std"),
+                           prior(exponential(1), class="sd", group = "YearID"),
+                           prior(exponential(0.1), class="shape")),
+                 file = "Age_full_model.rds",
+                 save_pars = save_pars(all = TRUE),
+                 seed = 24,
+                 file_refit = "on_change",
+                 iter = 2000, chains = 4, cores = 6)
+
+summary(ccf.age_full)
+plot(conditional_effects(ccf.age_full), points=T)
+plot(ccf.age_full)
+pp_check(ccf.age_full)
+bayes_R2(ccf.age_full)
+loo_ccf.age_full <- loo(ccf.age_full, moment_match = T, reloo=T)
+
+############ Age + Discharge * GDD #############
+get_prior(Increment_Perc ~ Annuli_Age + Median_std * GDD_std + (1|YearID),
+          family = Gamma(link="log"),
+          data=mod.data)
+
+ccf.age_int<-brm(Increment_Perc ~ Annuli_Age + Median_std * GDD_std + (1|YearID),
+               family = Gamma(link="log"), 
+               data = filter(mod.data, Annuli_Age>1&Annuli_Age<10), 
+               prior = c(prior(normal(5, 1), class = "Intercept"),
+                         prior(normal(-0.4, 0.1), class = "b", coef = "Annuli_Age"),
+                         prior(normal(0, 1), class = "b", coef = "Median_std"),
+                         prior(normal(0, 1), class = "b", coef = "GDD_std"),
+                         prior(normal(0, 1), class = "b", coef = "Median_std:GDD_std"),
+                         prior(exponential(1), class="sd", group = "YearID"),
+                         prior(exponential(0.1), class="shape")),
+               file = "Age_Int_model.rds",
+               save_pars = save_pars(all = TRUE),
+               seed = 24,
+               file_refit = "on_change",
+               iter = 2000, chains = 4, cores = 6)
+
+print(ccf.age_int, digits=3)
+plot(conditional_effects(ccf.age_int), points=T)
+plot(ccf.age_int)
+pp_check(ccf.age_int)
+bayes_R2(ccf.age_int)
+loo_ccf.age_int <- loo(ccf.age_int, moment_match = T, reloo=T)
+
+#compare models
+loo_compare(loo_ccf.age, loo_ccf.age_dis, loo_ccf.age_GDD, loo_ccf.age_full, loo_ccf.age_int)
+
+
+#Probability of positive slopes
+sum(as_draws_df(ccf.age_int)$b_Median_std>0)/4000
+sum(as_draws_df(ccf.age_int)$b_GDD_std>0)/4000
+################################################################################
+######### Final Plot
+###############################################################################
+###  Simulate based on observed Discharge and GDD values  ##
+#create a dataset using the observed discharge and GDD values and 150 fish ranging in length from the min to max observed TL at Scotland
+sim.dat<-filter(mod.data, Annuli_Age>1&Annuli_Age<10)
+
+sim <- tibble(expand.grid(Median_std = c(min(mod.data$Median_std), 0, 1), 
+                          GDD_std = c(1,0, -1),
+                          Annuli_Age = seq(2,9,1)))
+
+#Sample posterior for magnitude of difference
+posts.sim <- add_epred_draws(ccf.age_int, re_formula = NULL,
+                             newdata = sim %>% 
+                               mutate(Year_ID = "New_Fish"),
+                             allow_new_levels = TRUE, dpar=T)
+
+#calculate means and 95% quantile-based CrI
+qi<-posts.sim%>% group_by(Median_std, GDD_std, Annuli_Age) %>% 
+  mean_qi(.epred);as.data.frame(qi)
+
+
+ccf_grow <- qi %>% ggplot(aes(col=Median_std))+
+  geom_line(aes(x=Annuli_Age, y=.epred, group=interaction(GDD_std, Median_std), 
+                col=Median_std, linetype = as.factor(GDD_std)), linewidth=1)+
+  geom_point(data=sim.dat, aes(x=Annuli_Age, y=Increment_Perc, color=Median_std),alpha=0.3, pch=19, size=2, position = position_jitterdodge(jitter.width = .2, dodge.width = 0))+
+  annotate("text",label="Channel Catfish - James River", x=5.5, y=300, size=4, fontface="bold")+
+  theme_classic()+
+  xlab(NULL)+
+  scale_x_continuous(breaks=seq(2,9,1), labels=NULL)+
+  guides(color = guide_colorbar(order = 1),
+         linetype = guide_legend(order = 2))+
+  scale_linetype_manual(values=c(3,1,4), 
+                        labels=c(round((-1*sd(unique(mod.data$GDD)))+mean(unique(mod.data$GDD)),0),
+                                 round((0*sd(unique(mod.data$GDD)))+mean(unique(mod.data$GDD)),0),
+                                 round((1*sd(unique(mod.data$GDD)))+mean(unique(mod.data$GDD)),0)))+
+  ylab("   ")+
+  ylim(c(0,300))+
+  theme(axis.text=element_text(size=12), 
+        axis.title=element_text(size=16))+
+  labs(color=expression(Discharge~(m^3/s)),  linetype="GDD")+
+  scale_color_continuous(breaks=c(min(mod.data$Median_std),0,1,max(mod.data$Median_std)), 
+                         low = "#ECA877", high = "#8561BF",
+                         labels=c(round((min(mod.data$Median_std)*sd(flows$Median_Disch))+mean(flows$Median_Disch),0),
+                                  round((0*sd(flows$Median_Disch))+mean(flows$Median_Disch),0),
+                                  round((1*sd(flows$Median_Disch))+mean(flows$Median_Disch),0),
+                                  round((max(mod.data$Median_std)*sd(flows$Median_Disch))+mean(flows$Median_Disch),0))); ccf_grow
+
+ggsave("CCF_James_Growth_Discharge.jpeg", height=5, width=8, units="in")
