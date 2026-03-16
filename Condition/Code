@@ -1,0 +1,709 @@
+library(tidyverse)
+library(tidybayes)
+library(modelr)
+library(magrittr)
+library(brms)
+library(FSA)
+library(dataRetrieval)
+library(lubridate)
+library(readxl)
+
+#load data
+load("Environment_catfish_condition.RData")
+
+#Get discharge values for various Months
+#James River -Scotland Info #06478500
+siteNo <- "06478500"  
+pCode <- "00060"
+start.date <- "2000-01-01"
+end.date <- "2024-8-24"
+
+#######Discharge Daily Values######
+dischargedv <- readNWISdv(siteNumbers = siteNo,
+                          parameterCd = pCode,
+                          startDate = start.date,
+                          endDate = end.date)
+dischargedv<-renameNWISColumns(dischargedv)
+
+dischargedv %<>% mutate(Year = as.numeric(format(dischargedv$Date, format = "%Y")), 
+                        Month = as.numeric(format(dischargedv$Date, format = "%m")), 
+                        Flow = Flow*0.0283168) ### Convert from cfs to cms
+
+ggplot(data = dischargedv,
+       aes(Date, Flow)) +
+  geom_line(linewidth=0.8)+
+  theme_classic()+
+  ylab("Discharge (cms)")+
+  theme(axis.text = element_text(size=15), 
+        axis.title = element_text(size=18))+
+  scale_y_continuous(labels = scales::comma) 
+
+
+
+#filter for Open Water only
+River_data<-filter(dischargedv, Month>3&Month<11)
+
+
+River_data %<>% group_by(Year) %>% mutate(MeanLast60days = zoo::rollmeanr(Flow, k=60, fill=NA), 
+                                          MeanLast30days = zoo::rollmeanr(Flow, k=30, fill=NA), 
+                                          MedianLast60days = zoo::rollmedianr(Flow, k=61, fill=NA), 
+                                          MedianLast30days = zoo::rollmedianr(Flow, k=31, fill=NA))
+
+water <- River_data %>% select(Date, Flow, Year, MeanLast60days:MedianLast30days);water
+
+#GDD from Menoo
+gdd<-read.csv("gdd.csv")
+cumu_gdd <- gdd %>% 
+  mutate(Date=as.Date(as.POSIXct(DATE, format="%Y-%m-%d")), #convert to date format in R
+         GDD30 = zoo::rollsumr(GDD, k=30, fill=NA)) %>% 
+  select(Date, cumulativeGDD, GDD30) %>% 
+  filter(Date %in% unique(cat$Date-1)) %>% #keep the data for all days before (not including) to the date of capture
+  mutate(Date = as.Date(as.POSIXct(Date+1, format="%Y-%m-%d")), 
+         Year = year(Date)) #adjusting the date so when paired with FHC data, only the days before capture are included 
+
+cumu_gdd %>% group_by(Year) %>% distinct(GDD30) %>% as.data.frame()
+
+#summary
+GDD<-tibble(Year=seq(2017,2021, 1), GDD_2_tourney = c(1038.0, 1092.5, 923.0, 1001.9, 997.9 ))
+GDD30<-tibble(Year=seq(2017,2021, 1), GDD30_2_tourney = c(449.4, 411.35,456.9,431.1,392.65))
+
+#######################################
+###### Create cats.csv data file ######
+cat2<-merge(cat, water, by=c("Year", "Date"))
+cats.1<-merge(cat2, GDD, by="Year")
+cats.1_1<-merge(cats.1, GDD30, by="Year")
+(ccf.cuts<-psdVal("Channel Catfish"))
+(wsCCF<-wsVal("Channel Catfish"))
+
+cats.1_1%<>% mutate(LenCat=lencat(Length,w=10), 
+                logtl=log10(Length),
+                logwt=log10(Weight),
+                gcat=lencat(Length, breaks=ccf.cuts, use.names = T,drop.levels = T),
+                Ws=10^(wsCCF[["int"]]+wsCCF[["slope"]]*logtl), 
+                Wr=Weight/Ws*100)
+cats.2<-filter(cats.1_1, !is.na(Wr))
+write.csv(cats.2,"cats.csv")
+
+
+####
+cats1<-read_csv("cats.csv")
+cats <-cats1 %>%  
+  filter(Year!="2022")%>%
+  mutate(Year_F=as.factor(Year),
+         L_cm=Length/10,
+         W_kg=Weight/1000,
+         L_std=(Length-mean(Length))/sd(Length),
+         Discharge_std=(MeanLast30days-mean(unique(MeanLast30days)))/sd(unique(MeanLast30days)),
+         Discharge_std_60=(MeanLast60days -mean(unique(MeanLast60days )))/sd(unique(MeanLast60days)),
+         GDD_std=(GDD_2_tourney - mean(unique(GDD_2_tourney)))/sd(unique(GDD_2_tourney)),
+         GDD30_std=(GDD30_2_tourney - mean(unique(GDD30_2_tourney)))/sd(unique(GDD30_2_tourney))) %>% 
+  subset(Wr<150)
+
+#summaries 
+cats %>% 
+  group_by(Year) %>% 
+  summarize(n = length(Weight), 
+            minGDD = min(GDD30_2_tourney ), 
+            maxGDD = max(GDD30_2_tourney ),
+            meanGDD = mean(unique(GDD30_2_tourney )),
+            sdGDD = sd(unique(GDD30_2_tourney )),
+            minDis = min(MeanLast30days),
+            maxDis = max(MeanLast30days), 
+            meanDis = mean(unique(MeanLast30days)), 
+            sdDis = sd(unique(MeanLast30days))) %>% 
+  as.data.frame()
+
+cats %>% distinct(Date)
+
+cats %>% group_by(Year) %>% 
+  summarize(n = length(Weight), 
+            minTL = min(Length),
+            maxTL = max(Length),
+            meanTL = mean(Length), 
+            minwr = min(Wr),
+            maxwr = max(Wr),
+            meanwr = mean(Wr)) %>% 
+  as.data.frame()
+
+#####################################################
+## Summarize sample sizes ##
+cats %>% group_by(Year, Spp) %>% summarize(n=length(Length))
+
+###########################################################################
+##################           Models to test           #####################
+###########################################################################
+########Prior simulation
+get_prior(logwt ~ logtl + Discharge_std, 
+          family = gaussian(),
+          data = cats)
+
+
+priors <- tibble(Intercept = rnorm(100, -5.8, 0.5),
+                 betaLen = rnorm(100, 3.3, 0.5),
+                 betaDisch = rnorm(100, 0, 0.2),
+                 iter = 1:100)
+
+
+prior_sims <- priors %>%
+  expand_grid(cats %>% distinct(logtl, Discharge_std)) %>%
+  mutate(sims = Intercept + betaLen*logtl + betaDisch*Discharge_std)
+
+#plot
+ggplot() + 
+  geom_line(data=prior_sims, aes(x = logtl, y = sims, group = interaction(Discharge_std,iter),
+                                 color=as.factor(Discharge_std)))  
+######Null model
+get_prior(logwt ~  logtl, 
+          family = gaussian(),
+          data = cats)
+
+mod0<- brm(logwt ~ logtl, 
+           family = gaussian(),
+           data = cats,
+           prior = c(prior(normal(-5.8, 0.5), class = "Intercept"),
+                     prior(normal(3.3, 0.5), coef = "logtl"),
+                     prior(exponential(.1), class = "sigma")),
+           file="length-weight0.rds",
+           file_refit = "on_change",
+           cores = 6, chains = 4, iter = 2000)
+
+print(mod0, digits=3)
+pp_check(mod0, ndraws = 50)
+plot(mod0)
+bayes_R2(mod0)
+
+######GDD model
+get_prior(logwt ~  logtl + GDD30_std, 
+          family = gaussian(),
+          data = cats)
+
+mod<- brm(logwt ~  logtl + GDD30_std, 
+          family = gaussian(),
+          data = cats,
+          prior = c(prior(normal(-5.8, 0.5), class = "Intercept"),
+                    prior(normal(3.3, 0.5), coef = "logtl"),
+                    prior(normal(0, 0.2), coef="GDD30_std"),
+                    prior(exponential(.1), class = "sigma")),
+          file="length-weight2.rds",
+          file_refit = "on_change",
+          cores = 8, chains = 4, iter = 2000)
+
+print(mod, digits=3)
+pp_check(mod, ndraws = 50)
+plot(mod)
+bayes_R2(mod)
+
+#### LogTL+Discharge Model
+mod2<- brm(logwt ~  logtl + Discharge_std, 
+           family = gaussian(),
+           data = cats,
+           prior = c(prior(normal(-5.8, 0.5), class = "Intercept"),
+                     prior(normal(3.3, 0.5), coef = "logtl"),
+                     prior(normal(0, 0.2), coef="Discharge_std"),
+                     prior(exponential(.1), class = "sigma")),
+           file="length-weight.rds",
+           file_refit = "on_change",
+           cores = 8, chains = 4, iter = 2000)
+
+print(mod2,digits=3)
+pp_check(mod2, ndraws = 50)
+plot(mod2)
+bayes_R2(mod2)
+
+#additive
+get_prior(logwt ~  logtl + Discharge_std + GDD30_std, 
+          family = gaussian(),
+          data = cats)
+
+mod3<- brm(logwt ~  logtl + Discharge_std + GDD30_std, 
+          family = gaussian(),
+          data = cats,
+          prior = c(prior(normal(-5.8, 0.5), class = "Intercept"),
+                    prior(normal(3.3, 0.5), coef = "logtl"),
+                    prior(normal(0, 0.2), coef="Discharge_std"),
+                    prior(normal(0, 0.2), coef="GDD30_std"),
+                    prior(exponential(.1), class = "sigma")),
+          file="length-weight3.rds",
+          file_refit = "on_change",
+          cores = 6, chains = 4, iter = 2000)
+
+print(mod3, digits=3)
+pp_check(mod3, ndraws = 50)
+plot(mod3)
+bayes_R2(mod3)
+
+#interaction
+get_prior(logwt ~  logtl + Discharge_std * GDD30_std, 
+          family = gaussian(),
+          data = cats)
+
+mod4<- brm(logwt ~ logtl + Discharge_std * GDD30_std, 
+           family = gaussian(),
+           data = cats,
+           prior = c(prior(normal(-5.8, 0.5), class = "Intercept"),
+                     prior(normal(3.3, 0.5), coef = "logtl"),
+                     prior(normal(0, 0.2), coef="Discharge_std"),
+                     prior(normal(0, 0.2), coef="GDD30_std"),
+                     prior(normal(0, 0.2), coef="Discharge_std:GDD30_std"),
+                     prior(exponential(.1), class = "sigma")),
+           file="length-weight5.rds",
+           file_refit = "on_change",
+           cores = 6, chains = 4, iter = 2000)
+
+print(mod4, digits=3)
+pp_check(mod4, ndraws = 50)
+plot(mod4)
+bayes_R2(mod4)
+
+##Compare models
+loo(mod0, mod, mod2, mod3,  mod4)
+
+#Probability statements for slope parameters
+sum(as_draws_df(mod4)$b_Discharge_std>0)/4000
+sum(as_draws_df(mod4)$b_GDD30_std<0)/4000
+sum(as_draws_df(mod4)$`b_Discharge_std:GDD30_std`<0)/4000
+
+sum((abs(as_draws_df(mod4)$`b_Discharge_std`)-abs(as_draws_df(mod4)$`b_GDD30_std`))>0)/4000
+
+##############CCF plot
+#This will result in a plot showing the mean Wr across all 150 fish in 4,000 iterations, displayed as a violin plot, by discharge and GDD
+sim2 <- tibble(expand_grid(Discharge_std = unique(cats$Discharge_std),#seq(-0.9, 1.3, 0.2),
+                           GDD30_std = c(sort(unique(cats$GDD30_std))[c(1,5)],0),
+                           logtl = seq(min(cats$logtl), max(cats$logtl), length.out = 150)))
+
+#
+more_draws<-add_epred_draws(newdata = sim2, mod4) %>% 
+  group_by(Discharge_std, GDD30_std, logtl) %>%  
+  mutate(TL=10^(logtl), 
+         WT=10^(.epred))%>% 
+  mutate(Ws=10^(wsVal("Channel Catfish")[["int"]]+wsVal("Channel Catfish")[["slope"]]*logtl), 
+         Wr=WT/Ws*100, 
+         GDD30_std=as.factor(GDD30_std)) 
+
+fish_draws <- more_draws %>% 
+  group_by(Discharge_std, GDD30_std, logtl) %>% #logtl provides simulated fish-specific means & 95% CrI
+  mean_qi(Wr) %>% 
+  mutate(GDD30_std = as.factor(GDD30_std))
+
+mean_draws <- fish_draws %>% 
+  group_by(Discharge_std, GDD30_std) %>% 
+  mean_qi(Wr)%>% 
+  mutate(GDD30_std = as.factor(GDD30_std))
+
+p2 <- mean_draws %>%   #For each of the 4,000 iterations, calculate the mean Wr from all 150 TLs
+  ggplot(aes(x=Discharge_std, y=Wr, group=interaction(Discharge_std,GDD30_std)))+ 
+  scale_color_manual(values=c("#79B0E0", "#FFC107","#F7617C" ), name="GDD", labels = c(392.7, 428.3, 456.9))+
+  scale_fill_manual(values=c("#79B0E0", "#FFC107","#F7617C"  ), name="GDD", labels = c(392.7, 428.3, 456.9))+
+  scale_linetype_manual(values=c(3,1,5),name="GDD",labels = c(392.7, 428.3, 456.9))+
+  geom_line(aes(group = GDD30_std,col=GDD30_std, linetype=GDD30_std))+
+  geom_ribbon(aes(y=Wr, x=Discharge_std, ymin=.lower, ymax=.upper, group=GDD30_std, fill=GDD30_std), alpha=0.2)+
+  theme_classic()+
+  ylab("     ")+ #expression("Relative weight ("~italic(W)[r]~")")
+  theme(axis.text=element_text(size=12), 
+        axis.title=element_text(size=15,face="bold"), 
+        legend.position=c(0.45, 0.95),
+        legend.direction ="horizontal",
+        legend.text=element_text(size=11), 
+        legend.title=element_text(size=14),
+        legend.background = element_rect(fill = "transparent", colour = NA))+
+  scale_y_continuous(limits=c(69,142), breaks=seq(70,140,10), labels=seq(70,140,10))+
+  scale_x_continuous(name = NULL, limits=c(-1,1.4), breaks=c(-0.9356378,-0.2858818,0.3638742,1.01363), 
+                    labels = c(round(-0.9356378*sd(unique(cats$MeanLast30days))+mean(unique(cats$MeanLast30days)),0), 
+                               round(-0.2858818*sd(unique(cats$MeanLast30days))+mean(unique(cats$MeanLast30days)),0),
+                               round(0.3638742*sd(unique(cats$MeanLast30days))+mean(unique(cats$MeanLast30days)),0),
+                               round(1.01363*sd(unique(cats$MeanLast30days))+mean(unique(cats$MeanLast30days)),0)));p2
+
+
+p2.1 <- p2 + geom_violin(data=fish_draws,aes(x = Discharge_std, y=Wr, group=interaction(Discharge_std, GDD30_std), fill=GDD30_std, col=GDD30_std),
+                 alpha=0.5, width=0.05, position="identity", trim = F); p2.1
+
+ggsave("CCF_Posterior_Wr_Interaction.jpeg", height=5, width=8, units="in", dpi=600)
+
+
+###########################################################################################################################################
+############################           Flathead Catfish                   #################################################################
+###########################################################################################################################################
+#load fish data
+fhc_lw1<-read_excel("FHC/FHC all data 2018-2024.xlsx", sheet="June")
+fhc_lw <- fhc_lw1 %>% 
+  filter(Site!="Yankton") %>% 
+  mutate(Date=as.Date(as.POSIXct(Date, format="%Y-%m-%d")), 
+         Year=as.factor(Year)); fhc_lw
+
+
+#load growing degree days data
+gdd<-read.csv("FHC/FHC_gdd.csv")
+cumu_gdd <- gdd %>% 
+  mutate(Date=as.Date(as.POSIXct(DATE, format="%Y-%m-%d")),#convert to date format in R
+         GDD30 = zoo::rollsumr(GDD, k=30, fill=NA)) %>% 
+  select(Date, cumulativeGDD, GDD30) %>% 
+  filter(Date %in% unique(fhc_lw$Date-1)) %>% #keep the data for all days before (not including) to the date of capture
+  mutate(Date = as.Date(as.POSIXct(Date+1, format="%Y-%m-%d"))) #adjusting the date so when paired with FHC data, only the days before capture are included 
+
+#merge data
+fhc_lw<-left_join(fhc_lw, cumu_gdd, by="Date")
+head(fhc_lw)
+
+#View PSD values and standard weight equation coefficients for Flathead Catfish
+(fhc.cuts<-psdVal("Flathead Catfish"))
+(wsFHC<-wsVal("Flathead Catfish"))
+
+#add necessary data
+fhc_lw2 <- fhc_lw %>% filter(Length>129) %>% #minimum size accoring to Bister et al. (2000)
+  mutate(LenCat=lencat(Length,w=10), 
+         logtl=log10(Length),
+         logwt=log10(Weight),
+         gcat=lencat(Length, breaks=fhc.cuts, use.names = T,drop.levels = T),
+         Ws=10^(wsFHC[["int"]]+wsFHC[["slope"]]*logtl), 
+         Wr=Weight/Ws*100)
+
+#exclude extreme values
+fhcats<-filter(fhc_lw2, !is.na(Wr) & Wr<151)
+
+################################
+######### Discharge ############
+################################
+#Get discharge values from the James River -Scotland gage
+siteNo <- "06478500"  
+pCode <- "00060"
+start.date <- "2000-01-01"
+end.date <- "2024-08-24"
+
+#######Discharge Daily Values######
+dischargedv <- readNWISdv(siteNumbers = siteNo,
+                          parameterCd = pCode,
+                          startDate = start.date,
+                          endDate = end.date)
+dischargedv<-renameNWISColumns(dischargedv)
+
+#convert values
+dischargedv %<>% mutate(Year = as.numeric(format(dischargedv$Date, format = "%Y")), 
+                        Month = as.numeric(format(dischargedv$Date, format = "%m")), 
+                        Flow = Flow*0.0283168) ### Convert from cfs to cms
+
+#filter for Open Water only: April to October
+River_data<-filter(dischargedv, Month>3&Month<11)
+
+#find recent 30- and 45-day rolling means and medians
+River_data %<>% group_by(Year) %>% mutate(MeanLast45days = zoo::rollmeanr(Flow, k=45, fill=NA), 
+                                          MeanLast30days = zoo::rollmeanr(Flow, k=30, fill=NA), 
+                                          MedianLast45days = zoo::rollmedianr(Flow, k=45, fill=NA), 
+                                          MedianLast30days = zoo::rollmedianr(Flow, k=31, fill=NA))
+
+#simplify dataset
+River_data_clean<-River_data %>%
+  select(Date, Flow, MeanLast45days:MedianLast30days)
+
+#merge with fish and GDD data
+fhc_dat <- merge(fhcats, River_data_clean, by=c("Date", "Year"))
+
+#z-score standardize Discharge and GDD
+fhc_df <- fhc_dat %>% 
+  mutate(Discharge_std=(MeanLast30days-mean(unique(MeanLast30days)))/sd(unique(MeanLast30days)), 
+         GDD_std=(cumulativeGDD-mean(unique(cumulativeGDD)))/sd(unique(cumulativeGDD)),
+         GDD30_std=(GDD30-mean(unique(GDD30)))/sd(unique(GDD30)))
+
+#view standardized values
+fhc_df %>% ggplot(aes(x=Discharge_std, y=Wr))+geom_point()
+fhc_df %>% ggplot(aes(x=GDD30_std, y=Wr))+geom_point()
+
+#summaries 
+fhc_df %>% 
+  group_by(Year) %>% 
+  summarize(n = length(Weight), 
+            minGDD = min(GDD30 ), 
+            maxGDD = max(GDD30 ),
+            meanGDD = mean(unique(GDD30 )),
+            sdGDD = sd(unique(GDD30 )),
+            minDis = min(MeanLast30days),
+            maxDis = max(MeanLast30days), 
+            meanDis = mean(unique(MeanLast30days)), 
+            sdDis = sd(unique(MeanLast30days))) %>% 
+  as.data.frame()
+
+fhc_df %>% distinct(Date)
+
+fhc_df %>% group_by(Year) %>% 
+  summarize(n = length(Weight), 
+            minTL = min(Length),
+            maxTL = max(Length),
+            meanTL = mean(Length), 
+            minwr = min(Wr),
+            maxwr = max(Wr),
+            meanwr = mean(Wr))
+#####################################################################
+#################### Run Models and Compare #########################
+#####################################################################
+##Bayesian Model: log-transformed Weight by length * discharge
+get_prior(logwt ~  logtl + Discharge_std, 
+          family = gaussian(),
+          data = fhc_df)
+
+mod.dis<- brm(logwt ~  logtl + Discharge_std, 
+           family = gaussian(),
+           data = fhc_df,
+           prior = c(prior(normal(-5.5, 0.5), class = "Intercept"),
+                     prior(normal(3.2, 0.5), coef = "logtl"),
+                     prior(normal(0, 0.2), coef="Discharge_std"),
+                     prior(exponential(.1), class = "sigma")),
+           #sample_prior = "only",
+           file_refit = "on_change",
+           file="length-weight-fhc.rds",
+           cores = 6, chains = 4, iter = 2000)
+
+print(mod.dis,digits=3)
+pp_check(mod.dis, ndraws = 50)
+plot(mod.dis)
+bayes_R2(mod.dis)
+
+#Length only model
+get_prior(logwt ~  logtl, 
+          family = gaussian(),
+          data = fhc_df)
+
+mod.null<- brm(logwt ~ logtl , 
+               family = gaussian(),
+               data = fhc_df,
+               prior = c(prior(normal(-5.5, 0.5), class = "Intercept"),
+                         prior(normal(3.2, 0.5), coef = "logtl"),
+                         prior(exponential(.1), class = "sigma")),
+               file_refit="on_change",
+               file="length-weight-fhc-null.rds",
+               cores = 6, chains = 4, iter = 2000)
+
+print(mod.null, digits=3)
+pp_check(mod.null, ndraws = 50)
+plot(mod.null)
+bayes_R2(mod.null)
+
+#GDD model
+get_prior(logwt ~  logtl+GDD30_std, 
+          family = gaussian(),
+          data = fhc_df)
+
+mod.gdd<- brm(logwt ~ logtl + GDD30_std , 
+              family = gaussian(),
+              data = fhc_df,
+              prior = c(prior(normal(-5.5, 0.5), class = "Intercept"),
+                        prior(normal(3.2, 0.5), coef = "logtl"),
+                        prior(normal(0, 0.2), coef="GDD30_std"),
+                        prior(exponential(.1), class = "sigma")),
+              file_refit="on_change",
+              file="length-weight-fhc-gdd.rds",
+              cores = 6, chains = 4, iter = 2000)
+
+print(mod.gdd, digits=3)
+pp_check(mod.gdd, ndraws = 50)
+plot(mod.gdd)
+bayes_R2(mod.gdd)
+
+#Discharge + GDD model
+get_prior(logwt ~  logtl + Discharge_std + GDD30_std, 
+          family = gaussian(),
+          data = fhc_df)
+
+mod.full<- brm(logwt ~ logtl + Discharge_std + GDD30_std , 
+               family = gaussian(),
+               data = fhc_df,
+               prior = c(prior(normal(-5.5, 0.5), class = "Intercept"),
+                         prior(normal(3.2, 0.5), coef = "logtl"),
+                         prior(normal(0, 0.2), coef="Discharge_std"),
+                         prior(normal(0, 0.2), coef="GDD30_std"),
+                         prior(exponential(.1), class = "sigma")),
+               file_refit="on_change",
+               file="length-weight-fhc-full.rds",
+               cores = 8, chains = 4, iter = 2000)
+
+print(mod.full, digits=3)
+pp_check(mod.full, ndraws = 50)
+plot(mod.full)
+bayes_R2(mod.full)
+
+#Discharge * GDD model
+get_prior(logwt ~  logtl + Discharge_std * GDD30_std, 
+          family = gaussian(),
+          data = fhc_df)
+
+mod.int<- brm(logwt ~ logtl + Discharge_std * GDD30_std , 
+              family = gaussian(),
+              data = fhc_df,
+              prior = c(prior(normal(-5.5, 0.5), class = "Intercept"),
+                        prior(normal(3.2, 0.5), coef = "logtl"),
+                        prior(normal(0, 0.2), coef="Discharge_std"),
+                        prior(normal(0, 0.2), coef="GDD30_std"),
+                        prior(normal(0, 0.2), coef="Discharge_std:GDD30_std"),
+                        prior(exponential(.1), class = "sigma")),
+              file_refit="on_change",
+              file="length-weight-fhc-int.rds",
+              cores = 8, chains = 4, iter = 2000)
+
+print(mod.int, digits=3)
+pp_check(mod.int, ndraws = 50)
+plot(mod.int)
+bayes_R2(mod.int)
+
+#Compare models
+loo(mod.dis, mod.null, mod.gdd, mod.full, mod.int)
+
+#Probability statements for slope parameters
+sum(as_draws_df(mod.int)$b_Discharge_std<0)/4000
+sum(as_draws_df(mod.int)$b_GDD30_std>0)/4000
+sum(as_draws_df(mod.int)$`b_Discharge_std:GDD30_std`>0)/4000
+
+sum((abs(as_draws_df(mod.int)$`b_Discharge_std`)-abs(as_draws_df(mod.int)$`b_GDD30_std`))>0)/4000
+
+#### Plot best model
+###Draw lines for simulated length-weight relationships across varying discharge
+#sample from posterior
+temp<-mod.int$data %>% add_epred_draws(mod.int)
+
+fhc_df %>% summarize(min(GDD30_std), max(GDD30_std),
+                     min(Discharge_std), max(Discharge_std))
+#create a dataset of discharge and length sequences
+#length.out=9 will draw 9 lines on the plot
+new_df <- tibble(expand.grid(GDD30_std = c(-1,0,1), #seq(-1.5, 1.3, length.out = 8),0
+                             Discharge_std = c(-1,0,1),#c(seq(-1.3, 1.4, length.out=8),0),
+                             logtl = seq(min(fhc_df$logtl), max(fhc_df$logtl), length.out = 9)))
+
+#using mod.gdd, add predictions for logwt using the new dataset 
+temp_plot_data <- add_epred_draws(newdata = new_df, mod.int) %>% 
+  group_by(GDD30_std, Discharge_std, logtl) %>% 
+  median_qi(.epred) #grouped by discharge and logtl, find the median value
+
+#Plot as a line
+temp_plot_data %>% 
+  ggplot(aes(x = logtl, y = .epred,  
+             group =  interaction(Discharge_std, GDD30_std))) + 
+  geom_point(data=fhc_df, aes(x=logtl, y=logwt, col=Discharge_std),alpha=0.4)+
+  geom_line(linewidth=1,aes(col=(Discharge_std), linetype=as.factor(GDD30_std)))+
+  labs(y=expression(log[10]~weight), x=expression(log[10]~~total~length))+
+  theme_classic()
+
+#####
+###  Simulate based on observed Discharge and GDD values  ##
+#create a dataset using the observed discharge and GDD values and 150 fish ranging in length from the min to max observed TL at Scotland
+sim_fhc <- tibble(expand_grid(GDD30_std = c(sort(unique(fhc_df$GDD30_std))[c(1,25)],0), 
+                          Discharge_std = c(sort(unique(fhc_df$Discharge_std))[c(1,25)],0),
+                          logtl = seq(min(fhc_df$logtl), max(fhc_df$logtl), length.out = 150)))
+
+#violin plot with all 4,000*150 draws
+#####
+# Draw 4,000 samples for each of the 150 simulated catfish using  5 discharges
+# Results in 3 million simulated points
+all_draws<-add_epred_draws(newdata = sim_fhc, mod.int) %>% 
+  group_by(GDD30_std, Discharge_std, logtl) %>%  
+  mutate(TL=10^(logtl), 
+         WT=10^(.epred))%>% 
+  mutate(Ws=10^(wsVal("Flathead Catfish")[["int"]]+wsVal("Flathead Catfish")[["slope"]]*logtl), 
+         Wr=WT/Ws*100) %>% 
+  mutate(GDD30_std=plyr::mapvalues(GDD30_std, from=sort(unique(fhc_df$GDD30_std))[c(1,12,25)], to=sort(unique(fhc_df$GDD30_std))[c(1,12,25)]),
+         Discharge_std=plyr::mapvalues(Discharge_std, from=sort(unique(fhc_df$Discharge_std))[c(1,12,25)], to=sort(unique(fhc_df$Discharge_std))[c(1,12,25)]))
+
+#Group by discharge, GDD, and ".row" which is essentially the fish id
+#this will result in a plot showing the mean weight of each fish at given TL values, with color different by discharge
+all_draws %>% 
+  group_by(GDD30_std, Discharge_std,.row) %>% 
+  mean_qi(TL, WT) %>% 
+  ggplot(aes(y=WT, x=TL))+
+  geom_point(data=fhc_df, aes(x=Length, y=Weight),alpha=0.3, size=2)+
+  geom_line(aes(col=as.factor(GDD30_std), linetype=as.factor(Discharge_std)))+
+  geom_ribbon(aes(y=WT, x=TL, ymin=WT.lower, ymax=WT.upper, group=interaction(as.factor(GDD30_std),as.factor(Discharge_std)),fill=as.factor(GDD30_std)), alpha=0.2, colour=NA)+
+  theme_classic()+
+  scale_color_manual(values=c("#79B0E0", "#FFC107","#F7617C"), labels=round(sort(unique(all_draws$GDD30_std)),1))+ #"#B715FD", "#000000", "#FFC107"
+  scale_fill_manual(values=c("#79B0E0", "#FFC107","#F7617C"),labels=round(sort(unique(all_draws$GDD30_std)),1))+
+  ylab("Weight (g)")+
+  xlab("Total Length (mm)")+
+  theme(axis.text=element_text(size=12), 
+        axis.title=element_text(size=16))+
+  scale_x_continuous(limits=c(100,1200), breaks=seq(00,1200,200), labels=seq(0,1200,200))+
+  labs(color="Growing degree days", fill="Growing degree days")+
+  scale_linetype(name = 'Discharge', labels=c(-1.3,-0.1, 1.4))+
+  scale_y_continuous(limits=c(0,25000),labels=seq(0,25000,5000), breaks=seq(0,25000,5000))
+
+#ggsave("FHC_Posterior_Length-Weight.jpeg", height=5, width=8, units="in")
+
+#################################################################################################################################
+#Group by discharge and "GDD30_std" which is essentially the iteration
+#This will result in a plot showing the mean Wr across all 150 fish in 4,000 iterations, displayed as a violin plot, by discharge
+sim2_fhc <- tibble(expand_grid(GDD30_std = c(sort(unique(fhc_df$GDD30_std))[c(1,25)],0), 
+                           Discharge_std = sort(unique(fhc_df$Discharge_std))[c(1,5,9,10,12,14,16,19,22,25)],
+                           logtl = seq(min(fhc_df$logtl), max(fhc_df$logtl), length.out = 150)))
+
+all_draws2<-add_epred_draws(newdata = sim2_fhc, mod.int) %>% 
+  group_by(GDD30_std, Discharge_std, logtl) %>%  
+  mutate(TL=10^(logtl), 
+         WT=10^(.epred))%>% 
+  mutate(Ws=10^(wsVal("Flathead Catfish")[["int"]]+wsVal("Flathead Catfish")[["slope"]]*logtl), 
+         Wr=WT/Ws*100) 
+
+
+fish_draws_fhc <- all_draws2 %>% 
+  group_by(Discharge_std, GDD30_std, logtl) %>% #logtl provides simulated fish-specific means & 95% CrI
+  mean_qi(Wr) %>% 
+  mutate(GDD30_std = as.factor(GDD30_std))
+
+mean_draws_fhc <- fish_draws_fhc %>% 
+  group_by(Discharge_std, GDD30_std) %>% 
+  mean_qi(Wr)%>% 
+  mutate(GDD30_std = as.factor(GDD30_std))
+
+plot2 <- mean_draws_fhc %>%   #For each of the 4,000 iterations, calculate the mean Wr from all 150 TLs
+  ggplot(aes(x=Discharge_std, y=Wr, group=interaction(Discharge_std,GDD30_std)))+ 
+  scale_color_manual(values=c("#79B0E0", "#FFC107","#F7617C"), name="GDD", labels = c(232.7, 332.7, 417.5))+
+  scale_fill_manual(values=c("#79B0E0", "#FFC107","#F7617C" ), name="GDD", labels = c(232.7, 332.7, 417.5))+
+  scale_linetype_manual(values=c(3,1,5),name="GDD",labels = c(232.7, 332.7, 417.5))+
+  geom_line(aes(group = GDD30_std,col=GDD30_std, linetype=GDD30_std))+
+  geom_ribbon(aes(y=Wr, x=Discharge_std, ymin=.lower, ymax=.upper, group=GDD30_std, fill=GDD30_std), alpha=0.2)+
+  theme_classic()+
+  ylab(expression(Relative~weight~(italic(W)[r])))+  
+  theme(axis.text=element_text(size=12), 
+        axis.title=element_text(size=15,face="bold"), 
+        axis.title.y = element_text(hjust=1.9),
+        legend.position=c(0.45, 0.95),
+        legend.direction ="horizontal",
+        legend.text=element_text(size=11), 
+        legend.title=element_text(size=14),
+        legend.background = element_rect(fill = "transparent", colour = NA))+
+  scale_y_continuous(limits=c(75,110), breaks=seq(80,110,10), labels=seq(80,110,10))+
+  scale_x_continuous(name = expression(Discharge~(m^3/s)), limits=c(-1.55,1.8), 
+                     breaks=c(-1.423615,-0.3826134,0.6583877,1.699389), 
+                     labels = c(round(-1.423615*sd(unique(fhc_df$MeanLast30days))+mean(unique(fhc_df$MeanLast30days)),0), 
+                                round(-0.3826134*sd(unique(fhc_df$MeanLast30days))+mean(unique(fhc_df$MeanLast30days)),0),
+                                round(0.6583877*sd(unique(fhc_df$MeanLast30days))+mean(unique(fhc_df$MeanLast30days)),0),
+                                round(1.699389*sd(unique(fhc_df$MeanLast30days))+mean(unique(fhc_df$MeanLast30days)),0)));plot2
+
+
+plot2.1 <- plot2 + geom_violin(data=fish_draws_fhc,aes(x = Discharge_std, y=Wr, group=interaction(Discharge_std, as.factor(GDD30_std)), 
+                                        fill=as.factor(GDD30_std), col=as.factor(GDD30_std)),
+                    alpha=0.5, width=0.05, position="identity", trim=F); plot2.1
+
+ggsave("FHC_Posterior_Wr_Interaction.jpeg", height=5, width=8, units="in", dpi=600)
+
+#stack plots into one figure --> no violins
+plot_stack<-cowplot::align_plots(p2, plot2, align="v", axis="l")
+cowplot::plot_grid(plot_stack[[1]], plot_stack[[2]], ncol = 1, rel_heights = c(0.48,0.52))
+
+ggsave("Stacked_Catfish_Condition_NO-Violin.jpeg", height=8, width=5, units="in", dpi=600)
+#stack plots into one figure --> with violins
+plot_stack2<-cowplot::align_plots(p2.1, plot2.1, align="v", axis="l")
+cowplot::plot_grid(plot_stack2[[1]], plot_stack2[[2]], ncol = 1, rel_heights = c(0.48,0.52))
+
+ggsave("Stacked_Catfish_Condition_with-Violins.jpeg", height=8, width=5, units="in", dpi=600)
+
+
+#summaries at upper and lower discharge
+b<-fish_draws_fhc %>% 
+  select(logtl, Discharge_std, GDD30_std, Wr) %>% 
+  filter(Discharge_std > 1.412372 & GDD30_std!=0| Discharge_std < -1.336794 & GDD30_std!=0) %>% 
+  pivot_wider(names_from=c(Discharge_std, GDD30_std), values_from = Wr) %>% 
+  rename(Mins = `-1.33679421495092_-1.5992633432241`,
+         MinD_MaxGDD = `-1.33679421495092_1.35641176906302`,
+         Maxes=`1.41237272350292_1.35641176906302`, 
+         MaxD_MinGDD = `1.41237272350292_-1.5992633432241`) %>% 
+  mutate(Low_diff = Mins-MinD_MaxGDD,
+         High_diff = Maxes - MaxD_MinGDD);b
+
+b %>% summarize(mean(Low_diff), sd(Low_diff), mean(High_diff), sd(High_diff))
+
+#
+0.2840273 *sd(unique(fhc_df$MeanLast30days))+mean(unique(fhc_df$MeanLast30days))
