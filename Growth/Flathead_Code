@@ -12,8 +12,7 @@ library(magrittr)
 #####################################
 #########Growing Degree Days
 #####################################
-gd<-read.csv("TemperatureDataForGDD.csv")
-str(gd)
+load("Flathead_growth.Rdata")
 gdd <- gd %>% mutate(DATE =  mdy(Date), 
                      NAME = ifelse(grepl("SIOUX", Station), "Sioux Falls", "Menno"),
                      TMAX = round((TMAX.F.-32)*5/9,1),
@@ -92,7 +91,6 @@ River_data_fhc %>%
 ######################################################################
 #############     Back-Calculated Growth      ########################
 ######################################################################
-BC_fhc <- readxl::read_excel("All_Spine_Measures_and_Back_Calculations.xlsx", sheet = "FHC")
 BC_fhc %>% group_by(Year) %>% summarize(n=length(Spp))
 BC_calc_fhc <- BC_fhc  %>% 
   mutate(YearID = paste(Year,ID, sep="_")) %>% 
