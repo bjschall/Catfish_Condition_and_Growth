@@ -12,8 +12,7 @@ library(magrittr)
 #####################################
 #########Growing Degree Days
 #####################################
-gd<-read.csv("TemperatureDataForGDD.csv")
-str(gd)
+load("JamesChannel_growth.Rdata")
 gdd <- gd %>% mutate(DATE =  mdy(Date), 
                      NAME = ifelse(grepl("SIOUX", Station), "Sioux Falls", "Menno"),
                      TMAX = round((TMAX.F.-32)*5/9,1),
@@ -90,7 +89,6 @@ River_data %>%
 ######################################################################
 #############     Back-Calculated Growth      ########################
 ######################################################################
-BC <- readxl::read_excel("All_Spine_Measures_and_Back_Calculations.xlsx", sheet = "CCF")
 BC %>% group_by(Year) %>% summarize(n=length(Spp))
 BC_calc <- BC %>% 
   mutate(YearID = paste(Year,ID, sep="_")) %>% 
