@@ -9,10 +9,6 @@ library(lubridate)
 library(readxl)
 
 #options(buildtools.check = function(action) TRUE )
-cat<-read_csv("Scotland All Years.csv")
-cat<-droplevels(subset(cat, Spp=="CCF")) 
-
-cat %<>% mutate(Date=mdy(Date))
 
 #Get discharge values for various Months
 #James River -Scotland Info #06478500
@@ -55,8 +51,6 @@ River_data %<>% group_by(Year) %>% mutate(MeanLast60days = zoo::rollmeanr(Flow, 
 water <- River_data %>% select(Date, Flow, Year, MeanLast60days:MedianLast30days);water
 
 #GDD from Menoo
-gdd<-read.csv("gdd.csv")
-
 #convert air temp to stream water temp in deg C
 # from eq. 2 in Mohseni, O., Erickson, T. R., & Stefan, H. G. (1997). A Non-Linear Regression Model for Weekly Stream Temperatures at 585 Gaging Stations in the US.
 estimate_streamtemp = function(x){
@@ -348,15 +342,13 @@ p2.1 <- p2 + geom_violin(data=fish_draws,aes(x = Discharge_std, y=Wr, group=inte
 ############################           Flathead Catfish                   #################################################################
 ###########################################################################################################################################
 #load fish data
-fhc_lw1<-read_excel("FHC/FHC all data 2018-2024.xlsx", sheet="June")
 fhc_lw <- fhc_lw1 %>% 
   filter(Site!="Yankton") %>% 
   mutate(Date=as.Date(as.POSIXct(Date, format="%Y-%m-%d")), 
          Year=as.factor(Year)); fhc_lw
 
 
-#load growing degree days data
-gdd_fhc<-read.csv("FHC/FHC_gdd.csv")
+#growing degree days data
 gdd_conv <- gdd_fhc %>% 
   mutate(TMAX_conv = estimate_streamtemp(TMAX),
          TMIN_conv = estimate_streamtemp(TMIN),
