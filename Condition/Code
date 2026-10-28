@@ -8,7 +8,15 @@ library(dataRetrieval)
 library(lubridate)
 library(readxl)
 
-#options(buildtools.check = function(action) TRUE )
+cat<-read_csv("Scotland All Years.csv")
+cat<-droplevels(subset(cat, Spp=="CCF")) 
+cat %<>% mutate(Date=mdy(Date))
+gdd<-read.csv("gdd.csv")
+fhc_lw1<-read_excel("FHC/FHC all data 2018-2024.xlsx", sheet="June")
+gdd_fhc<-read.csv("FHC/FHC_gdd.csv")
+
+#load enviornment
+load("Environment_Catfish_Condition.RData")
 
 #Get discharge values for various Months
 #James River -Scotland Info #06478500
@@ -176,11 +184,11 @@ mod0<- brm(logwt ~ logtl,
            data = cats,
            prior = c(prior(normal(-5.8, 0.5), class = "Intercept"),
                      prior(normal(3.3, 0.5), coef = "logtl"),
-                     prior(exponential(.1), class = "sigma")),
+                     prior(exponential(0.1), class = "sigma")),
            #sample_prior = "only",
-           file="length-weight0.rds",
+           file="ccf-length-weight.rds",
            file_refit = "on_change",
-           cores = 6, chains = 4, iter = 2000)
+           cores = 8, chains = 4, iter = 4000)
 
 print(mod0, digits=3)
 pp_check(mod0, ndraws = 50)
@@ -192,22 +200,22 @@ get_prior(logwt ~  logtl + GDD30_std,
           family = gaussian(),
           data = cats)
 
-mod<- brm(logwt ~  logtl + GDD30_std, 
+mod1<- brm(logwt ~  logtl + GDD30_std, 
           family = gaussian(),
           data = cats,
           prior = c(prior(normal(-5.8, 0.5), class = "Intercept"),
                     prior(normal(3.3, 0.5), coef = "logtl"),
                     prior(normal(0, 0.2), coef="GDD30_std"),
-                    prior(exponential(.1), class = "sigma")),
+                    prior(exponential(0.1), class = "sigma")),
           #sample_prior = "only",
-          file="length-weight2.rds",
+          file="ccf-length-weight1.rds",
           file_refit = "on_change",
-          cores = 8, chains = 4, iter = 2000)
+          cores = 8, chains = 4, iter = 4000)
 
-print(mod, digits=3)
-pp_check(mod, ndraws = 50)
-plot(mod)
-bayes_R2(mod)
+print(mod1, digits=3)
+pp_check(mod1, ndraws = 50)
+plot(mod1)
+bayes_R2(mod1)
 
 #### LogTL+Discharge Model
 mod2<- brm(logwt ~  logtl + Discharge_std, 
@@ -218,9 +226,9 @@ mod2<- brm(logwt ~  logtl + Discharge_std,
                      prior(normal(0, 0.2), coef="Discharge_std"),
                      prior(exponential(.1), class = "sigma")),
            #sample_prior = "only",
-           file="length-weight.rds",
+           file="ccf-length-weight2.rds",
            file_refit = "on_change",
-           cores = 8, chains = 4, iter = 2000)
+           cores = 8, chains = 4, iter = 4000)
 
 print(mod2,digits=3)
 pp_check(mod2, ndraws = 50)
@@ -241,9 +249,9 @@ mod3<- brm(logwt ~  logtl + Discharge_std + GDD30_std,
                     prior(normal(0, 0.2), coef="GDD30_std"),
                     prior(exponential(.1), class = "sigma")),
           #sample_prior = "only",
-          file="length-weight3.rds",
+          file="ccf-length-weight3.rds",
           file_refit = "on_change",
-          cores = 6, chains = 4, iter = 2000)
+          cores = 6, chains = 4, iter = 4000)
 
 print(mod3, digits=3)
 pp_check(mod3, ndraws = 50)
@@ -265,9 +273,9 @@ mod4<- brm(logwt ~ logtl + Discharge_std * GDD30_std,
                      prior(normal(0, 0.2), coef="Discharge_std:GDD30_std"),
                      prior(exponential(.1), class = "sigma")),
            #sample_prior = "only",
-           file="length-weight5.rds",
+           file="ccf-length-weight4.rds",
            file_refit = "on_change",
-           cores = 6, chains = 4, iter = 2000)
+           cores = 6, chains = 4, iter = 4000)
 
 print(mod4, digits=3)
 pp_check(mod4, ndraws = 50)
@@ -275,11 +283,11 @@ plot(mod4)
 bayes_R2(mod4)
 
 ##Compare models
-loo(mod0, mod, mod2, mod3,  mod4)
+loo(mod0, mod1, mod2, mod3,  mod4)
 
 #Probability statements for slope parameters
-sum(as_draws_df(mod3)$b_Discharge_std>0)/4000
-sum(as_draws_df(mod3)$b_GDD30_std>0)/4000
+sum(as_draws_df(mod3)$b_Discharge_std>0)/8000
+sum(as_draws_df(mod3)$b_GDD30_std>0)/8000
 
 ##### Plot best model
 #Group by discharge and ".draw" which is essentially the iteration
@@ -336,7 +344,7 @@ p2 <- mean_draws %>%   #For each of the 4,000 iterations, calculate the mean Wr 
 p2.1 <- p2 + geom_violin(data=fish_draws,aes(x = Discharge_std, y=Wr, group=interaction(Discharge_std, GDD30_std), fill=GDD30_std, col=GDD30_std),
                  alpha=0.5, width=0.05, position="identity", trim = F); p2.1
 
-#ggsave("CCF_Posterior_Wr_Additive.jpeg", height=5, width=5, units="in", dpi=600)
+ggsave("CCF_Posterior_Wr_Additive.jpeg", height=5, width=5, units="in", dpi=600)
 
 ###########################################################################################################################################
 ############################           Flathead Catfish                   #################################################################
@@ -348,7 +356,7 @@ fhc_lw <- fhc_lw1 %>%
          Year=as.factor(Year)); fhc_lw
 
 
-#growing degree days data
+# growing degree days data
 gdd_conv <- gdd_fhc %>% 
   mutate(TMAX_conv = estimate_streamtemp(TMAX),
          TMIN_conv = estimate_streamtemp(TMIN),
@@ -464,24 +472,6 @@ get_prior(logwt ~  0 + Intercept + logtl + Discharge_std + (1|Year),
           family = gaussian(),
           data = fhc_df)
 
-#Discharge mod
-mod.dis.re<- brm(logwt ~  0 + Intercept + logtl + Discharge_std + (1|Year), 
-              family = gaussian(),
-              data = fhc_df,
-              prior = c(prior(normal(-5.5, 0.5), class="b", coef = "Intercept"),
-                        prior(normal(3.2, 0.5), coef = "logtl"),
-                        prior(normal(0, 0.2), coef="Discharge_std"),
-                        prior(exponential(0.1), class = "sigma"), 
-                        prior(exponential(5), class = "sd")),
-              #sample_prior = "only",
-              file_refit = "on_change",
-              control = list(adapt_delta = 0.99),
-              file="length-weight-fhc-dis-RE.rds",
-              cores = 6, chains = 4, iter = 4000)
-
-summary(mod.dis.re)
-bayes_R2(mod.dis.re)
-
 #Length mod
 mod.null.re<- brm(logwt ~  0 + Intercept + logtl + (1|Year), 
                  family = gaussian(),
@@ -494,28 +484,32 @@ mod.null.re<- brm(logwt ~  0 + Intercept + logtl + (1|Year),
                  file_refit = "on_change",
                  control = list(adapt_delta = 0.99),
                  file="length-weight-fhc-RE.rds",
-                 cores = 6, chains = 4, iter = 4000)
+                 cores = 8, chains = 4, iter = 4000)
 
-print(mod.null.re, digits=4)
+print(mod.null.re, digits=3)
+pp_check(mod.null.re, ndraws = 50)
+plot(mod.null.re)
 bayes_R2(mod.null.re)
 
-#Interaction
-mod.int.re<- brm(logwt ~ 0 + Intercept + logtl + Discharge_std * GDD30_std + (1|Year), 
-              family = gaussian(),
-              data = fhc_df,
-              prior = c(prior(normal(-5.5, 0.5), class="b", coef = "Intercept"),
-                        prior(normal(3.2, 0.5), coef = "logtl"),
-                        prior(normal(0, 0.2), coef="Discharge_std"),
-                        prior(normal(0, 0.2), coef="GDD30_std"),
-                        prior(normal(0, 0.2), coef="Discharge_std:GDD30_std"),
-                        prior(exponential(.1), class = "sigma"), 
-                        prior(exponential(5), class = "sd")),
-              file_refit="on_change",
-              control = list(adapt_delta = 0.99),
-              file="length-weight-fhc-int-re.rds",
-              cores = 8, chains = 4, iter = 2000)
+#Discharge mod
+mod.dis.re<- brm(logwt ~  0 + Intercept + logtl + Discharge_std + (1|Year), 
+                 family = gaussian(),
+                 data = fhc_df,
+                 prior = c(prior(normal(-5.5, 0.5), class="b", coef = "Intercept"),
+                           prior(normal(3.2, 0.5), coef = "logtl"),
+                           prior(normal(0, 0.2), coef="Discharge_std"),
+                           prior(exponential(0.1), class = "sigma"), 
+                           prior(exponential(5), class = "sd")),
+                 #sample_prior = "only",
+                 file_refit = "on_change",
+                 control = list(adapt_delta = 0.99),
+                 file="length-weight-fhc-dis-RE.rds",
+                 cores = 8, chains = 4, iter = 4000)
 
-bayes_R2(mod.int.re)
+print(mod.dis.re, digits=3)
+pp_check(mod.dis.re, ndraws = 50)
+plot(mod.dis.re)
+bayes_R2(mod.dis.re)
 
 #GDD
 mod.gdd.re<- brm(logwt ~ 0 + Intercept + logtl + GDD30_std + (1|Year), 
@@ -529,8 +523,11 @@ mod.gdd.re<- brm(logwt ~ 0 + Intercept + logtl + GDD30_std + (1|Year),
               file_refit="on_change",
               control = list(adapt_delta = 0.99),
               file="length-weight-fhc-gdd-re.rds",
-              cores = 6, chains = 4, iter = 2000)
+              cores = 8, chains = 4, iter = 4000)
 
+print(mod.gdd.re, digits=3)
+pp_check(mod.gdd.re, ndraws = 50)
+plot(mod.gdd.re)
 bayes_R2(mod.gdd.re)
 
 #full
@@ -544,14 +541,38 @@ mod.full.re<- brm(logwt ~ 0 + Intercept + logtl + GDD30_std + Discharge_std+ (1|
                            prior(exponential(.1), class = "sigma"), 
                            prior(exponential(5), class = "sd")),
                  file_refit="on_change",
-                 control = list(adapt_delta = 0.99),
+                 control = list(adapt_delta = 0.99, max_treedepth=12),
                  file="length-weight-fhc-full-re.rds",
-                 cores = 6, chains = 4, iter = 2000)
+                 cores = 8, chains = 4, iter = 4000)
 
+print(mod.full.re, digits=3)
+pp_check(mod.full.re, ndraws = 50)
+plot(mod.full.re)
 bayes_R2(mod.full.re)
 
+#Interaction
+mod.int.re<- brm(logwt ~ 0 + Intercept + logtl + Discharge_std * GDD30_std + (1|Year), 
+                 family = gaussian(),
+                 data = fhc_df,
+                 prior = c(prior(normal(-5.5, 0.5), class="b", coef = "Intercept"),
+                           prior(normal(3.2, 0.5), coef = "logtl"),
+                           prior(normal(0, 0.2), coef="Discharge_std"),
+                           prior(normal(0, 0.2), coef="GDD30_std"),
+                           prior(normal(0, 0.2), coef="Discharge_std:GDD30_std"),
+                           prior(exponential(.1), class = "sigma"), 
+                           prior(exponential(5), class = "sd")),
+                 file_refit="on_change",
+                 control = list(adapt_delta = 0.99, max_treedepth=12),
+                 file="length-weight-fhc-int-re.rds",
+                 cores = 8, chains = 4, iter = 4000)
+
+print(mod.int.re, digits=3)
+pp_check(mod.int.re, ndraws = 50)
+plot(mod.int.re)
+bayes_R2(mod.int.re)
+
 #compare
-loo(mod.dis.re, mod.null.re, mod.int.re, mod.full.re, mod.gdd.re)
+loo(mod.null.re, mod.dis.re, mod.full.re, mod.gdd.re, mod.int.re)
 
 
 #plot posterior
